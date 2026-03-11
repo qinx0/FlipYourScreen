@@ -11,6 +11,14 @@
 	"version": "v1.0.0",
 	"developer": "qinx",
 	"description": "",
+	"links": {
+		"source": "https://github.com/qinx0/FlipYourScreen"
+	},
+	"issues": {
+		"info": "Github Issues tab",
+		"url": "https://github.com/qinx0/FlipYourScreen/issues"
+	},
+	"tags": ["offline"],
 	"dependencies": {
 		"geode.node-ids": ">=v1.20.0"
 	},
