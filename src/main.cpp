@@ -2,170 +2,154 @@
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/PauseLayer.hpp>
-#include <Geode/binding/GJBaseGameLayer.hpp>
-#include <unordered_map>
 
 using namespace geode::prelude;
 
-// ─────────────────────────────────────────────
-//  State
-// ─────────────────────────────────────────────
 static bool  s_modEnabled  = true;
 static bool  s_flipUI      = false;
-static float s_targetAngle = 0.f; // current target rotation (0 or 180)
+static float s_targetAngle = 0.f;
+static bool  s_initDone    = false;
 
-// ─────────────────────────────────────────────
-//  Helpers
-// ─────────────────────────────────────────────
-CCNode* getGameWrapper(PlayLayer* pl) {
-    return pl ? pl->getChildByID("gravity-game-wrapper"_spr) : nullptr;
-}
-
-void animateRotation(CCNode* node, float targetAngle, float speed) {
+static void rotateTo(CCNode* node, float angle, float speed) {
     if (!node) return;
     node->stopAllActions();
-    node->runAction(
-        CCEaseInOut::create(CCRotateTo::create(speed, targetAngle), 2.0f)
-    );
+    if (speed <= 0.f) {
+        node->setRotation(angle);
+        return;
+    }
+    node->runAction(CCEaseInOut::create(CCRotateTo::create(speed, angle), 2.0f));
 }
 
-// Stores original HUD positions so we can restore them on unflip.
-// Key = node pointer, value = original position
-static std::unordered_map<CCNode*, CCPoint> s_originalHUDPositions;
-
-void storeOriginalHUDPos(CCNode* node) {
-    if (!node) return;
-    // Only store once (don't overwrite with flipped position)
-    if (s_originalHUDPositions.find(node) == s_originalHUDPositions.end())
-        s_originalHUDPositions[node] = node->getPosition();
+static bool isHUDNode(CCNode* n) {
+    if (!n) return false;
+    auto id = n->getID();
+    return id == "progress-bar"
+        || id == "percentage-label"
+        || id == "UILayer"
+        || id == "debug-text";
 }
 
-void clearStoredHUDPositions() {
-    s_originalHUDPositions.clear();
-}
-
-// Flip a HUD node: rotate 180° AND mirror its position across the screen centre.
-// This makes top-left elements move to bottom-right, matching the rotated game view.
-void setHUDNodeFlipped(CCNode* node, bool flipped) {
-    if (!node) return;
+static void syncHUDNode(CCNode* n, float angleDeg, CCPoint origPos) {
+    if (!n) return;
     auto winSize = CCDirector::sharedDirector()->getWinSize();
-
-    // Always store original before we change anything
-    storeOriginalHUDPos(node);
-
-    node->setRotation(flipped ? 180.f : 0.f);
-
-    if (flipped) {
-        // Mirror position across screen centre: (x,y) → (W-x, H-y)
-        CCPoint orig = s_originalHUDPositions[node];
-        node->setPosition({winSize.width - orig.x, winSize.height - orig.y});
-    } else {
-        // Restore original position
-        if (s_originalHUDPositions.count(node))
-            node->setPosition(s_originalHUDPositions[node]);
-    }
+    float cx = winSize.width  * 0.5f;
+    float cy = winSize.height * 0.5f;
+    // Translate to screen-centre origin, inverse-rotate, translate back
+    float px  = origPos.x;
+    float py  = origPos.y;
+    float rad  = angleDeg * (float)M_PI / 180.f;
+    float cosA = cosf(rad);
+    float sinA = sinf(rad);
+    n->setPosition(CCPoint(
+         px * cosA + py * sinA + cx,
+        -px * sinA + py * cosA + cy
+    ));
+    n->setRotation(-angleDeg);
 }
 
-void resetHUDNodes(PlayLayer* pl) {
-    if (!pl) return;
-    for (auto* n : {(CCNode*)pl->m_percentageLabel,
-                    (CCNode*)pl->m_attemptLabel,
-                    (CCNode*)pl->m_progressBar}) {
-        if (!n) continue;
-        n->setRotation(0.f);
-        if (s_originalHUDPositions.count(n))
-            n->setPosition(s_originalHUDPositions[n]);
-    }
-    clearStoredHUDPositions();
-}
-
-// ─────────────────────────────────────────────
-//  Hook PlayerObject
-// ─────────────────────────────────────────────
 class $modify(MyPlayerObject, PlayerObject) {
     void flipGravity(bool isFlipped, bool noEffects) {
         PlayerObject::flipGravity(isFlipped, noEffects);
-        if (!s_modEnabled) return;
+        if (!s_modEnabled || !s_initDone) return;
         if (m_isSecondPlayer) return;
-
         auto* pl = PlayLayer::get();
         if (!pl) return;
 
-        float speed = static_cast<float>(Mod::get()->getSettingValue<double>("rotation-speed"));
+        float speed   = static_cast<float>(Mod::get()->getSettingValue<double>("rotation-speed"));
         s_targetAngle = isFlipped ? 180.f : 0.f;
-
-        // Rotate the game wrapper (objects, ground, bg — everything in it)
-        animateRotation(getGameWrapper(pl), s_targetAngle, speed);
-
-        // If UI flip on, rotate HUD nodes directly (no reparenting)
-        if (s_flipUI) {
-            setHUDNodeFlipped(pl->m_percentageLabel, isFlipped);
-            setHUDNodeFlipped(pl->m_attemptLabel, isFlipped);
-            setHUDNodeFlipped(pl->m_progressBar, isFlipped);
-        }
+        rotateTo(pl, s_targetAngle, speed);
     }
 };
 
-// ─────────────────────────────────────────────
-//  Hook PlayLayer
-// ─────────────────────────────────────────────
-class $modify(MyPlayLayer, PlayLayer) {
+struct MyPlayLayer : geode::Modify<MyPlayLayer, PlayLayer> {
+    struct Fields {
+        std::unordered_map<CCNode*, CCPoint> hudOrigPos;
+        bool positionsCaptured = false;
+    };
+
+    // Called every frame. On the very first frame, captures HUD positions —
+    // by then GD and all mods have finished their init positioning.
+    void captureHUDPositions() {
+        if (m_fields->positionsCaptured) return;
+        m_fields->positionsCaptured = true;
+
+        auto winSize = CCDirector::sharedDirector()->getWinSize();
+        auto* children = this->getChildren();
+        for (unsigned int i = 0; i < children->count(); i++) {
+            auto* child = static_cast<CCNode*>(children->objectAtIndex(i));
+            if (isHUDNode(child)) {
+                // Convert from bottom-left origin to screen-centre origin
+                // (PlayLayer anchor is now 0.5,0.5 at winSize/2)
+                CCPoint pos = child->getPosition();
+                pos.x -= winSize.width  * 0.5f;
+                pos.y -= winSize.height * 0.5f;
+                m_fields->hudOrigPos[child] = pos;
+                log::info("HUD {} captured at screen-centre pos: {},{}", child->getID(), pos.x, pos.y);
+            }
+        }
+    }
+
+    void syncHUD(float) {
+        captureHUDPositions();
+        if (!s_modEnabled || s_flipUI) return;
+        float angle = this->getRotation();
+        for (auto& [node, origPos] : m_fields->hudOrigPos)
+            syncHUDNode(node, angle, origPos);
+    }
 
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
+        s_initDone = false;
+
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
         s_modEnabled  = Mod::get()->getSettingValue<bool>("enabled");
         s_flipUI      = Mod::get()->getSettingValue<bool>("rotate-ui");
         s_targetAngle = 0.f;
 
-        auto winSize = CCDirector::sharedDirector()->getWinSize();
-
-        // Single game wrapper — reparent m_objectLayer into it exactly
-        // as the original working code did
-        auto* wrapper = CCNode::create();
-        wrapper->setID("gravity-game-wrapper"_spr);
-        wrapper->setAnchorPoint({0.5f, 0.5f});
-        wrapper->setPosition(winSize / 2);
-        wrapper->setContentSize(winSize);
-
-        if (m_objectLayer) {
-            CCPoint origPos = m_objectLayer->getPosition();
-            m_objectLayer->retain();
-            m_objectLayer->removeFromParentAndCleanup(false);
-            m_objectLayer->setPosition(origPos - CCPoint(winSize / 2));
-            wrapper->addChild(m_objectLayer);
-            m_objectLayer->release();
+        if (s_modEnabled) {
+            auto winSize = CCDirector::sharedDirector()->getWinSize();
+            this->ignoreAnchorPointForPosition(false);
+            this->setAnchorPoint({0.5f, 0.5f});
+            this->setPosition(winSize / 2);
+            this->schedule(schedule_selector(MyPlayLayer::syncHUD));
         }
 
-        this->addChild(wrapper, 1);
+        s_initDone = true;
         return true;
     }
 
     void resetLevel() {
-        // Snap wrapper back to 0
-        if (auto* w = getGameWrapper(this)) {
-            w->stopAllActions();
-            w->setRotation(0.f);
-        }
-        resetHUDNodes(this);
+        s_initDone = false;
+        this->stopAllActions();
+        this->setRotation(0.f);
         s_targetAngle = 0.f;
+        // Reset HUD nodes to original positions before resetLevel repositions them
+        for (auto& [node, origPos] : m_fields->hudOrigPos) {
+            node->setPosition(origPos);
+            node->setRotation(0.f);
+        }
         PlayLayer::resetLevel();
+        s_initDone = true;
     }
 
     void onQuit() {
+        s_initDone = false;
         s_targetAngle = 0.f;
+        this->stopAllActions();
+        this->setRotation(0.f);
+        this->ignoreAnchorPointForPosition(true);
+        this->setAnchorPoint({0.f, 0.f});
+        this->setPosition({0.f, 0.f});
         PlayLayer::onQuit();
     }
 };
 
-// ─────────────────────────────────────────────
-//  Hook PauseLayer
-// ─────────────────────────────────────────────
 class $modify(MyPauseLayer, PauseLayer) {
 
     void onToggleMod(CCObject* sender) {
         s_modEnabled = !s_modEnabled;
         Mod::get()->setSettingValue("enabled", s_modEnabled);
+
         auto* spr = static_cast<ButtonSprite*>(
             static_cast<CCMenuItemSpriteExtra*>(sender)->getNormalImage());
         spr->setString(s_modEnabled ? "Flip ON" : "Flip OFF");
@@ -173,33 +157,28 @@ class $modify(MyPauseLayer, PauseLayer) {
         if (!s_modEnabled) {
             auto* pl = PlayLayer::get();
             if (!pl) return;
-            if (auto* w = getGameWrapper(pl)) {
-                w->stopAllActions(); w->setRotation(0.f);
-            }
-            resetHUDNodes(pl);
+            float speed = static_cast<float>(Mod::get()->getSettingValue<double>("rotation-speed"));
+            rotateTo(pl, 0.f, speed);
+            s_targetAngle = 0.f;
         }
     }
 
     void onToggleUI(CCObject* sender) {
         s_flipUI = !s_flipUI;
         Mod::get()->setSettingValue("rotate-ui", s_flipUI);
+
         auto* spr = static_cast<ButtonSprite*>(
             static_cast<CCMenuItemSpriteExtra*>(sender)->getNormalImage());
         spr->setString(s_flipUI ? "UI Flip ON" : "UI Flip OFF");
 
-        auto* pl = PlayLayer::get();
+        // When turning UI flip ON, reset HUD nodes back to their original positions
+        auto* pl = static_cast<MyPlayLayer*>(PlayLayer::get());
         if (!pl) return;
-
-        bool isFlipped = (s_targetAngle == 180.f);
-
         if (s_flipUI) {
-            // Sync HUD to current gravity state
-            setHUDNodeFlipped(pl->m_percentageLabel, isFlipped);
-            setHUDNodeFlipped(pl->m_attemptLabel, isFlipped);
-            setHUDNodeFlipped(pl->m_progressBar, isFlipped);
-        } else {
-            // Restore HUD to normal
-            resetHUDNodes(pl);
+            for (auto& [node, origPos] : pl->m_fields->hudOrigPos) {
+                node->setPosition(origPos);
+                node->setRotation(0.f);
+            }
         }
     }
 
@@ -222,8 +201,8 @@ class $modify(MyPauseLayer, PauseLayer) {
         menu->addChild(flipBtn);
         menu->addChild(uiBtn);
         menu->alignItemsVerticallyWithPadding(4.f);
-        menu->setPosition({ 60.f, 40.f });
-        menu->setID("gravity-camera-menu"_spr);
+        menu->setPosition({60.f, 40.f});
+        menu->setID("flip-your-screen-menu"_spr);
         this->addChild(menu, 10);
     }
 };
