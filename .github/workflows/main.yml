@@ -1,11 +1,5 @@
 name: Build Geode Mod
 
-on:
-  workflow_dispatch:
-  push:
-    branches:
-      - "**"
-
 jobs:
   build:
     strategy:
@@ -55,3 +49,24 @@ jobs:
         with:
           name: Build Output
           path: ${{ steps.build.outputs.build-output }}
+  release:
+    name: Create draft release
+    runs-on: ubuntu-latest
+    needs: ['package']
+    permissions:
+      contents: write
+ 
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Build Output
+          path: ./artifacts
+ 
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          tag_name: ${{ github.ref_name }}-${{ github.run_number }}
+          name: Release ${{ github.ref_name }}
+          files: ./artifacts/*.geode
+ 
