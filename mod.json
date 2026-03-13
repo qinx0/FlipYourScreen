@@ -19,9 +19,6 @@
 		"url": "https://github.com/qinx0/FlipYourScreen/issues"
 	},
 	"tags": ["offline"],
-	"dependencies": {
-		"geode.node-ids": ">=v1.20.0"
-	},
 	"settings": {
 		"enabled": {
 			"name": "Enabled",
